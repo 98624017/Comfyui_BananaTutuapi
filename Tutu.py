@@ -38,6 +38,19 @@ def save_config(config):
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
 
+def clean_model_name(model_with_tag):
+    """清理模型名称，移除提供商标签"""
+    if not model_with_tag.startswith('['):
+        return model_with_tag
+
+    try:
+        tag_end = model_with_tag.find(']')
+        if tag_end == -1:
+            return model_with_tag
+        return model_with_tag[tag_end + 2:]  # 去掉"] "
+    except:
+        return model_with_tag
+
 
 # ===== 预设管理系统 =====
 def get_presets_file():
@@ -180,15 +193,18 @@ class TutuGeminiAPI:
                 "api_provider": (
                     [
                         "ai.comfly.chat",
-                        "OpenRouter"
+                        "OpenRouter",
+                        "APICore.ai"
                     ],
                     {"default": "ai.comfly.chat"}
                 ),
                 "model": (
                     [
                         "[Comfly] gemini-2.5-flash-image-preview",
-                        "[Comfly] gemini-2.0-flash-preview-image-generation", 
-                        "[OpenRouter] google/gemini-2.5-flash-image-preview"
+                        "[Comfly] gemini-2.0-flash-preview-image-generation",
+                        "[OpenRouter] google/gemini-2.5-flash-image-preview",
+                        "[APICore] gemini-2.5-flash-image",
+                        "[APICore] gemini-2.5-flash-image-hd"
                     ],
                     {"default": "[Comfly] gemini-2.5-flash-image-preview"}
                 ),
@@ -204,8 +220,12 @@ class TutuGeminiAPI:
                     "placeholder": "ai.comfly.chat API Key (optional, leave blank to use config)"
                 }),
                 "openrouter_api_key": ("STRING", {
-                    "default": "", 
+                    "default": "",
                     "placeholder": "OpenRouter API Key (optional, leave blank to use config)"
+                }),
+                "apicore_api_key": ("STRING", {
+                    "default": "",
+                    "placeholder": "APICore.ai API Key (optional, leave blank to use config)"
                 }),
                 "input_image_1": ("IMAGE",),  
                 "input_image_2": ("IMAGE",),
@@ -224,6 +244,7 @@ class TutuGeminiAPI:
         config = get_config()
         self.comfly_api_key = config.get('comfly_api_key', config.get('api_key', ''))  # 向后兼容
         self.openrouter_api_key = config.get('openrouter_api_key', '')
+        self.apicore_api_key = config.get('apicore_api_key', '')
         self.timeout = 120
     
     def _truncate_base64_in_response(self, text, max_base64_len=100):
@@ -268,6 +289,8 @@ class TutuGeminiAPI:
         """根据API提供商获取对应的API key"""
         if api_provider == "OpenRouter":
             return self.openrouter_api_key
+        elif api_provider == "APICore.ai":
+            return self.apicore_api_key
         else:
             return self.comfly_api_key
             
@@ -321,14 +344,18 @@ class TutuGeminiAPI:
             "Accept": "application/json",
             "Authorization": f"Bearer {current_api_key}"
         }
-        
+
         # OpenRouter需要额外的headers
         if api_provider == "OpenRouter":
             headers.update({
                 "HTTP-Referer": "https://comfyui.com",
                 "X-Title": "ComfyUI Tutu Nano Banana"
             })
-        
+        # APICore.ai使用标准Bearer认证
+        elif api_provider == "APICore.ai":
+            # APICore.ai使用标准headers，无需额外配置
+            pass
+
         print(f"[Tutu DEBUG] Generated headers for {api_provider}: {headers}")
         return headers
 
@@ -457,6 +484,115 @@ class TutuGeminiAPI:
         print(f"[Tutu DEBUG] 所有上传服务都失败，将使用压缩的base64格式")
         return None
 
+    def process_apicore_response(self, response):
+        """处理APICore.ai的标准JSON响应"""
+        try:
+            print(f"[Tutu DEBUG] 开始处理APICore.ai标准JSON响应...")
+
+            # 解析JSON响应
+            response_data = response.json()
+            print(f"[Tutu DEBUG] APICore.ai响应数据结构: {list(response_data.keys())}")
+
+            # 提取图片URL - APICore.ai可能使用不同的响应格式
+            image_content = ""
+
+            # 常见的APICore.ai响应格式检查
+            if 'data' in response_data:
+                data = response_data['data']
+                print(f"[Tutu DEBUG] 找到data字段，类型: {type(data)}")
+
+                if isinstance(data, list):
+                    # 如果data是数组，遍历每个元素
+                    for i, item in enumerate(data):
+                        print(f"[Tutu DEBUG] 处理data[{i}]: {list(item.keys()) if isinstance(item, dict) else type(item)}")
+
+                        if isinstance(item, dict):
+                            # 查找图片URL字段
+                            for url_field in ['url', 'image_url', 'generated_image', 'data']:
+                                if url_field in item:
+                                    url = item[url_field]
+                                    print(f"[Tutu DEBUG] 🎯 在data[{i}].{url_field}找到图片URL: {url[:50] if isinstance(url, str) else type(url)}...")
+                                    if isinstance(url, str):
+                                        image_content += url + " "
+                        elif isinstance(item, str) and ('http' in item or 'data:image/' in item):
+                            # 如果数组元素直接是URL字符串
+                            print(f"[Tutu DEBUG] 🎯 data[{i}]直接是URL: {item[:50]}...")
+                            image_content += item + " "
+
+                elif isinstance(data, dict):
+                    # 如果data是字典，直接查找URL字段
+                    print(f"[Tutu DEBUG] data是字典: {list(data.keys())}")
+                    for url_field in ['url', 'image_url', 'generated_image', 'data']:
+                        if url_field in data:
+                            url = data[url_field]
+                            print(f"[Tutu DEBUG] 🎯 在data.{url_field}找到图片URL: {url[:50] if isinstance(url, str) else type(url)}...")
+                            if isinstance(url, str):
+                                image_content += url + " "
+
+            # 检查顶级字段中的图片URL
+            for url_field in ['url', 'image_url', 'generated_image', 'images', 'choices']:
+                if url_field in response_data:
+                    value = response_data[url_field]
+                    print(f"[Tutu DEBUG] 检查顶级字段{url_field}: {type(value)}")
+
+                    if isinstance(value, str) and ('http' in value or 'data:image/' in value):
+                        print(f"[Tutu DEBUG] 🎯 在顶级{url_field}找到图片URL: {value[:50]}...")
+                        image_content += value + " "
+                    elif isinstance(value, list):
+                        for i, item in enumerate(value):
+                            if isinstance(item, str) and ('http' in item or 'data:image/' in item):
+                                print(f"[Tutu DEBUG] 🎯 在{url_field}[{i}]找到图片URL: {item[:50]}...")
+                                image_content += item + " "
+                            elif isinstance(item, dict):
+                                # 查找嵌套的URL字段
+                                for nested_field in ['url', 'image_url', 'generated_image']:
+                                    if nested_field in item and isinstance(item[nested_field], str):
+                                        url = item[nested_field]
+                                        print(f"[Tutu DEBUG] 🎯 在{url_field}[{i}].{nested_field}找到图片URL: {url[:50]}...")
+                                        image_content += url + " "
+
+            # 如果仍然没有找到图片，尝试在整个响应中搜索
+            if not image_content.strip():
+                print(f"[Tutu DEBUG] 未在标准字段找到图片，搜索整个响应...")
+                response_str = json.dumps(response_data)
+
+                # 使用正则表达式查找可能的图片URL
+                import re
+                patterns = [
+                    r'data:image/[^",\s]+',  # base64 图片
+                    r'https?://[^",\s]+\.(?:png|jpg|jpeg|gif|webp)',  # 图片URL
+                    r'https?://[^",\s]+/[^",\s]*[iI]mage[^",\s]*',  # 包含image的URL
+                ]
+
+                for pattern in patterns:
+                    urls = re.findall(pattern, response_str)
+                    if urls:
+                        print(f"[Tutu DEBUG] 🎯 用正则表达式{pattern}找到: {len(urls)}个URL")
+                        for url in urls:
+                            print(f"[Tutu DEBUG] 🎯 提取URL: {url[:50]}...")
+                            image_content += url + " "
+                        break
+
+            # 如果找到了图片内容，返回
+            if image_content.strip():
+                print(f"[Tutu DEBUG] APICore.ai响应处理成功，找到{len(image_content.split())}个图片URL")
+                return image_content.strip()
+            else:
+                # 如果没有找到图片，返回原始响应用于调试
+                print(f"[Tutu DEBUG] APICore.ai响应中未找到图片URL，返回原始响应")
+                print(f"[Tutu DEBUG] 完整响应结构: {json.dumps(response_data, indent=2)[:500]}...")
+                return json.dumps(response_data, ensure_ascii=False)
+
+        except json.JSONDecodeError as e:
+            print(f"[Tutu ERROR] APICore.ai响应JSON解析失败: {e}")
+            # 尝试直接返回文本内容
+            response_text = response.text
+            print(f"[Tutu DEBUG] 尝试处理纯文本响应: {response_text[:200]}...")
+            return response_text
+        except Exception as e:
+            print(f"[Tutu ERROR] APICore.ai响应处理出错: {e}")
+            return f"APICore.ai响应处理错误: {str(e)}"
+
     def process_sse_stream(self, response, api_provider="ai.comfly.chat"):
         """Process Server-Sent Events (SSE) stream from the API with provider-specific handling"""
         accumulated_content = ""
@@ -469,6 +605,7 @@ class TutuGeminiAPI:
         # Different APIs might have different response structures
         is_comfly = api_provider == "ai.comfly.chat"
         is_openrouter = api_provider == "OpenRouter"
+        is_apicore = api_provider == "APICore.ai"
         
         try:
             for line in response.iter_lines(decode_unicode=True, chunk_size=None):
@@ -498,53 +635,54 @@ class TutuGeminiAPI:
                         
                         # Extract content from the chunk
                         if 'choices' in chunk_data and chunk_data['choices']:
-                            choice = chunk_data['choices'][0]
-                            print(f"[Tutu DEBUG] 完整Choice结构: {choice}")
-                            
-                            # 检查delta中的所有字段
-                            if 'delta' in choice:
-                                delta = choice['delta']
-                                print(f"[Tutu DEBUG] Delta所有字段: {list(delta.keys())}")
-                                
-                                # 检查content字段
-                                if 'content' in delta:
-                                    content = delta['content']
-                                    print(f"[Tutu DEBUG] Delta.content: {repr(content[:200]) if content else 'None/Empty'}")
-                                    if content:
-                                        # 修复编码问题
-                                        try:
-                                            if isinstance(content, str):
-                                                content = content.encode('latin1').decode('utf-8')
-                                        except (UnicodeDecodeError, UnicodeEncodeError):
-                                            pass
-                                        accumulated_content += content
-                                        print(f"[Tutu DEBUG] 添加delta.content: {repr(content[:100])}")
-                                
-                                # 检查是否有其他包含图片数据的字段
-                                for key, value in delta.items():
-                                    if key != 'content' and isinstance(value, str):
-                                        print(f"[Tutu DEBUG] Delta.{key}: {repr(value[:200]) if len(str(value)) > 200 else repr(value)}")
-                                        # 检查是否是图片数据
-                                        if 'data:image/' in str(value) or 'base64,' in str(value):
-                                            print(f"[Tutu DEBUG] 🎯找到图片数据在delta.{key}中!")
-                                            accumulated_content += str(value)
-                                            print(f"[Tutu DEBUG] 添加图片数据: {len(str(value))}字符")
-                                    
-                            # 检查message中的内容
-                            elif 'message' in choice:
-                                message = choice['message']
-                                print(f"[Tutu DEBUG] Message所有字段: {list(message.keys())}")
-                                
-                                if 'content' in message:
-                                    content = message['content']
-                                    print(f"[Tutu DEBUG] Message.content: {repr(content[:200]) if content else 'None/Empty'}")
-                                    if content:
-                                        try:
-                                            if isinstance(content, str):
-                                                content = content.encode('latin1').decode('utf-8')
-                                        except (UnicodeDecodeError, UnicodeEncodeError):
-                                            pass
-                                        accumulated_content += content
+                            # 处理所有choices，支持多图生成
+                            for choice_idx, choice in enumerate(chunk_data['choices']):
+                                print(f"[Tutu DEBUG] Choice {choice_idx} 结构: {choice}")
+
+                                # 检查delta中的所有字段
+                                if 'delta' in choice:
+                                    delta = choice['delta']
+                                    print(f"[Tutu DEBUG] Choice {choice_idx} Delta所有字段: {list(delta.keys())}")
+
+                                    # 检查content字段
+                                    if 'content' in delta:
+                                        content = delta['content']
+                                        print(f"[Tutu DEBUG] Choice {choice_idx} Delta.content: {repr(content[:200]) if content else 'None/Empty'}")
+                                        if content:
+                                            # 修复编码问题
+                                            try:
+                                                if isinstance(content, str):
+                                                    content = content.encode('latin1').decode('utf-8')
+                                            except (UnicodeDecodeError, UnicodeEncodeError):
+                                                pass
+                                            accumulated_content += content
+                                            print(f"[Tutu DEBUG] 添加choice {choice_idx} delta.content: {repr(content[:100])}")
+
+                                    # 检查是否有其他包含图片数据的字段
+                                    for key, value in delta.items():
+                                        if key != 'content' and isinstance(value, str):
+                                            print(f"[Tutu DEBUG] Delta.{key}: {repr(value[:200]) if len(str(value)) > 200 else repr(value)}")
+                                            # 检查是否是图片数据
+                                            if 'data:image/' in str(value) or 'base64,' in str(value):
+                                                print(f"[Tutu DEBUG] 🎯找到图片数据在delta.{key}中!")
+                                                accumulated_content += str(value)
+                                                print(f"[Tutu DEBUG] 添加图片数据: {len(str(value))}字符")
+
+                                # 检查message中的内容
+                                elif 'message' in choice:
+                                    message = choice['message']
+                                    print(f"[Tutu DEBUG] Choice {choice_idx} Message所有字段: {list(message.keys())}")
+
+                                    if 'content' in message:
+                                        content = message['content']
+                                        print(f"[Tutu DEBUG] Choice {choice_idx} Message.content: {repr(content[:200]) if content else 'None/Empty'}")
+                                        if content:
+                                            try:
+                                                if isinstance(content, str):
+                                                    content = content.encode('latin1').decode('utf-8')
+                                            except (UnicodeDecodeError, UnicodeEncodeError):
+                                                pass
+                                            accumulated_content += content
                                         print(f"[Tutu DEBUG] 添加message.content: {repr(content[:100])}")
                                 
                                 # 检查message中的其他字段
@@ -621,6 +759,41 @@ class TutuGeminiAPI:
                                         else:
                                             print(f"[Tutu DEBUG] 🎯 OpenRouter提取URL: {url[:50]}...")
                                         accumulated_content += " " + url
+
+                        elif is_apicore:
+                            # APICore.ai 专用处理逻辑
+                            print(f"[Tutu DEBUG] 🔍 APICore.ai专用检查: 搜索图片数据")
+
+                            # 检查是否有任何图片相关的字段
+                            for key, value in chunk_data.items():
+                                if key not in ['id', 'object', 'created', 'model', 'system_fingerprint', 'choices', 'usage']:
+                                    if isinstance(value, str) and ('data:image/' in value or 'http' in value):
+                                        print(f"[Tutu DEBUG] 🎯 APICore.ai在{key}字段发现图片数据!")
+                                        accumulated_content += " " + value
+                                    elif value:
+                                        print(f"[Tutu DEBUG] APICore.ai额外字段{key}: {repr(str(value)[:100])}")
+
+                            # 全面搜索APICore.ai中的图片数据
+                            if 'data:image/' in chunk_str or 'generated_image' in chunk_str or 'image_url' in chunk_str:
+                                print(f"[Tutu DEBUG] 🎯 APICore.ai JSON中发现图片相关数据!")
+                                import re
+                                patterns = [
+                                    r'data:image/[^",\s]+',  # base64 图片
+                                    r'https?://[^",\s]+\.(?:png|jpg|jpeg|gif|webp)',  # 图片URL
+                                    r'"image_url":\s*"([^"]+)"',  # JSON中的image_url字段
+                                    r'"generated_image":\s*"([^"]+)"'  # 生成图片字段
+                                ]
+
+                                for pattern in patterns:
+                                    urls = re.findall(pattern, chunk_str)
+                                    if urls:
+                                        print(f"[Tutu DEBUG] 🎯 APICore.ai用模式找到: {len(urls)}个URL")
+                                        for url in urls:
+                                            if url.startswith('data:image/'):
+                                                print(f"[Tutu DEBUG] 🎯 APICore.ai提取base64图片")
+                                            else:
+                                                print(f"[Tutu DEBUG] 🎯 APICore.ai提取URL: {url[:50]}...")
+                                            accumulated_content += " " + url
                         
                         # 保存完整的响应数据用于调试
                         raw_response_parts.append(chunk_data)
@@ -657,34 +830,35 @@ class TutuGeminiAPI:
                             
                             # 处理这个合并后的chunk_data（重要！）
                             if 'choices' in chunk_data and chunk_data['choices']:
-                                choice = chunk_data['choices'][0]
-                                print(f"[Tutu DEBUG] 续行完整Choice结构: {choice}")
-                                
-                                # 检查delta中的所有字段
-                                if 'delta' in choice:
-                                    delta = choice['delta']
-                                    print(f"[Tutu DEBUG] 续行Delta所有字段: {list(delta.keys())}")
-                                    
-                                    # 检查content字段
-                                    if 'content' in delta:
-                                        content = delta['content']
-                                        print(f"[Tutu DEBUG] 续行Delta.content: {repr(content[:200]) if content else 'None/Empty'}")
-                                        if content:
-                                            try:
-                                                if isinstance(content, str):
-                                                    content = content.encode('latin1').decode('utf-8')
-                                            except (UnicodeDecodeError, UnicodeEncodeError):
-                                                pass
-                                            accumulated_content += content
-                                            print(f"[Tutu DEBUG] 从续行添加delta.content: {repr(content[:100])}")
-                                    
-                                    # 检查其他字段中的图片数据
-                                    for key, value in delta.items():
-                                        if key != 'content' and isinstance(value, str):
-                                            print(f"[Tutu DEBUG] 续行Delta.{key}: {repr(value[:200]) if len(str(value)) > 200 else repr(value)}")
-                                            if 'data:image/' in str(value) or 'base64,' in str(value):
-                                                print(f"[Tutu DEBUG] 🎯续行中找到图片数据在delta.{key}!")
-                                                accumulated_content += str(value)
+                                # 处理所有choices，支持多图生成
+                                for choice_idx, choice in enumerate(chunk_data['choices']):
+                                    print(f"[Tutu DEBUG] 续行Choice {choice_idx} 结构: {choice}")
+
+                                    # 检查delta中的所有字段
+                                    if 'delta' in choice:
+                                        delta = choice['delta']
+                                        print(f"[Tutu DEBUG] 续行Choice {choice_idx} Delta所有字段: {list(delta.keys())}")
+
+                                        # 检查content字段
+                                        if 'content' in delta:
+                                            content = delta['content']
+                                            print(f"[Tutu DEBUG] 续行Choice {choice_idx} Delta.content: {repr(content[:200]) if content else 'None/Empty'}")
+                                            if content:
+                                                try:
+                                                    if isinstance(content, str):
+                                                        content = content.encode('latin1').decode('utf-8')
+                                                except (UnicodeDecodeError, UnicodeEncodeError):
+                                                    pass
+                                                accumulated_content += content
+                                                print(f"[Tutu DEBUG] 从续行添加choice {choice_idx} delta.content: {repr(content[:100])}")
+
+                                        # 检查其他字段中的图片数据
+                                        for key, value in delta.items():
+                                            if key != 'content' and isinstance(value, str):
+                                                print(f"[Tutu DEBUG] 续行Delta.{key}: {repr(value[:200]) if len(str(value)) > 200 else repr(value)}")
+                                                if 'data:image/' in str(value) or 'base64,' in str(value):
+                                                    print(f"[Tutu DEBUG] 🎯续行中找到图片数据在delta.{key}!")
+                                                    accumulated_content += str(value)
                                                 print(f"[Tutu DEBUG] 从续行添加图片数据: {len(str(value))}字符")
                                         
                                 # 检查message中的内容
@@ -769,6 +943,38 @@ class TutuGeminiAPI:
                                             else:
                                                 print(f"[Tutu DEBUG] 🎯 OpenRouter续行提取URL: {url[:50]}...")
                                             accumulated_content += " " + url
+                            elif is_apicore:
+                                # APICore.ai续行处理
+                                print(f"[Tutu DEBUG] 🔍 APICore.ai续行检查: 搜索图片数据")
+
+                                # 检查顶级字段中的图片数据
+                                for key, value in chunk_data.items():
+                                    if key not in ['id', 'object', 'created', 'model', 'system_fingerprint', 'choices', 'usage']:
+                                        if isinstance(value, str) and ('data:image/' in value or 'http' in value):
+                                            print(f"[Tutu DEBUG] 🎯 APICore.ai续行在{key}发现图片数据!")
+                                            accumulated_content += " " + value
+
+                                # 全面搜索续行中的图片数据
+                                if 'data:image/' in chunk_str or 'generated_image' in chunk_str or 'image_url' in chunk_str:
+                                    print(f"[Tutu DEBUG] 🎯 APICore.ai续行JSON中发现图片相关数据!")
+                                    import re
+                                    patterns = [
+                                        r'data:image/[^",\s]+',
+                                        r'https?://[^",\s]+\.(?:png|jpg|jpeg|gif|webp)',
+                                        r'"image_url":\s*"([^"]+)"',
+                                        r'"generated_image":\s*"([^"]+)"'
+                                    ]
+
+                                    for pattern in patterns:
+                                        urls = re.findall(pattern, chunk_str)
+                                        if urls:
+                                            print(f"[Tutu DEBUG] 🎯 APICore.ai续行用模式找到: {len(urls)}个URL")
+                                            for url in urls:
+                                                if url.startswith('data:image/'):
+                                                    print(f"[Tutu DEBUG] 🎯 APICore.ai续行提取base64图片")
+                                                else:
+                                                    print(f"[Tutu DEBUG] 🎯 APICore.ai续行提取URL: {url[:50]}...")
+                                                accumulated_content += " " + url
                             
                             # 保存完整的响应数据用于调试
                             raw_response_parts.append(chunk_data)
@@ -908,16 +1114,16 @@ class TutuGeminiAPI:
         if not model_with_tag.startswith('['):
             # 如果没有标签，直接返回（向后兼容）
             return model_with_tag
-        
+
         try:
             # 解析标签和模型名
             tag_end = model_with_tag.find(']')
             if tag_end == -1:
                 return model_with_tag
-                
+
             provider_tag = model_with_tag[1:tag_end]  # 去掉方括号
             actual_model = model_with_tag[tag_end + 2:]  # 去掉"] "
-            
+
             # 验证提供商匹配
             if api_provider == "OpenRouter" and provider_tag != "OpenRouter":
                 print(f"[Tutu WARNING] 选择了OpenRouter但模型是{provider_tag}的")
@@ -925,10 +1131,13 @@ class TutuGeminiAPI:
             elif api_provider == "ai.comfly.chat" and provider_tag != "Comfly":
                 print(f"[Tutu WARNING] 选择了ai.comfly.chat但模型是{provider_tag}的")
                 return None
-            
+            elif api_provider == "APICore.ai" and provider_tag != "APICore":
+                print(f"[Tutu WARNING] 选择了APICore.ai但模型是{provider_tag}的")
+                return None
+
             print(f"[Tutu DEBUG] 解析模型: {provider_tag} -> {actual_model}")
             return actual_model
-            
+
         except Exception as e:
             print(f"[Tutu ERROR] 模型名称解析失败: {e}")
             return model_with_tag
@@ -937,12 +1146,91 @@ class TutuGeminiAPI:
         """根据API提供商获取推荐的模型选择"""
         if api_provider == "OpenRouter":
             return "• [OpenRouter] google/gemini-2.5-flash-image-preview (推荐，支持图片生成)"
+        elif api_provider == "APICore.ai":
+            return "• [APICore] gemini-2.5-flash-image (标准模型)\n• [APICore] gemini-2.5-flash-image-hd (高清模型，推荐)"
         else:  # ai.comfly.chat
             return "• [Comfly] gemini-2.5-flash-image-preview (推荐)\n• [Comfly] gemini-2.0-flash-preview-image-generation"
 
-    def process(self, prompt, api_provider, model, num_images, temperature, top_p, timeout=120, 
-                input_image_1=None, input_image_2=None, input_image_3=None, input_image_4=None, input_image_5=None, 
-                comfly_api_key="", openrouter_api_key=""):
+    def _get_api_key_error_message(self, api_provider, current_api_key):
+        """生成详细的API密钥错误信息"""
+        if api_provider == "APICore.ai":
+            return f"""❌ **APICore.ai API密钥配置问题**
+
+**当前状态**: {'API密钥为空' if not current_api_key else f'API密钥过短 ({len(current_api_key)} 字符)'}
+
+**📋 配置方法**:
+
+**方法1 - 在节点中直接输入**:
+1. 在节点的 "apicore_api_key" 输入框中输入您的API密钥
+2. 密钥格式通常为: sk-xxxxx...
+
+**方法2 - 修改配置文件**:
+1. 编辑文件: Tutuapi.json
+2. 将 "apicore_api_key" 字段的值替换为您的真实API密钥
+3. 保存文件后重新运行
+
+**获取APICore.ai API密钥**:
+• 访问 APICore.ai 官网注册账户
+• 在控制台中生成API密钥
+• 复制密钥到配置中
+
+**示例配置**:
+```json
+{{
+    "comfly_api_key": "your_comfly_api_key_here",
+    "openrouter_api_key": "your_openrouter_api_key_here",
+    "apicore_api_key": "sk-your-apicore-key-here"
+}}
+```
+
+**注意**: API密钥是敏感信息，请妥善保管，不要分享给他人。"""
+
+        elif api_provider == "OpenRouter":
+            return f"""❌ **OpenRouter API密钥配置问题**
+
+**当前状态**: {'API密钥为空' if not current_api_key else f'API密钥过短 ({len(current_api_key)} 字符)'}
+
+**📋 配置方法**:
+
+**方法1 - 在节点中直接输入**:
+1. 在节点的 "openrouter_api_key" 输入框中输入您的API密钥
+
+**方法2 - 修改配置文件**:
+1. 编辑文件: Tutuapi.json
+2. 将 "openrouter_api_key" 字段的值替换为您的真实API密钥
+
+**获取OpenRouter API密钥**:
+• 访问 https://openrouter.ai/
+• 注册账户并生成API密钥
+• 密钥格式: sk-or-v1-xxxxx...
+
+**注意**: API密钥是敏感信息，请妥善保管。"""
+
+        else:  # ai.comfly.chat
+            return f"""❌ **ai.comfly.chat API密钥配置问题**
+
+**当前状态**: {'API密钥为空' if not current_api_key else f'API密钥过短 ({len(current_api_key)} 字符)'}
+
+**📋 配置方法**:
+
+**方法1 - 在节点中直接输入**:
+1. 在节点的 "comfly_api_key" 输入框中输入您的API密钥
+
+**方法2 - 修改配置文件**:
+1. 编辑文件: Tutuapi.json
+2. 将 "comfly_api_key" 字段的值替换为您的真实API密钥
+
+**获取ai.comfly.chat API密钥**:
+• 访问 https://ai.comfly.chat/
+• 注册账户并获取API访问权限
+
+**向后兼容性**: 也支持旧版本的 "api_key" 字段名。
+
+**注意**: API密钥是敏感信息，请妥善保管。"""
+
+    def process(self, prompt, api_provider, model, num_images, temperature, top_p, timeout=120,
+                input_image_1=None, input_image_2=None, input_image_3=None, input_image_4=None, input_image_5=None,
+                comfly_api_key="", openrouter_api_key="", apicore_api_key=""):
 
         print(f"\n[Tutu DEBUG] ========== Starting Gemini API Process ==========")
         print(f"[Tutu DEBUG] Parameters:")
@@ -959,11 +1247,14 @@ class TutuGeminiAPI:
         print(f"\n[Tutu INFO] 💡 Model Selection Guide:")
         print(f"[Tutu INFO] • For ai.comfly.chat: Select [Comfly] tagged models")
         print(f"[Tutu INFO] • For OpenRouter: Select [OpenRouter] tagged models")
+        print(f"[Tutu INFO] • For APICore.ai: Select [APICore] tagged models")
         print(f"[Tutu INFO] • Current combination: {api_provider} + {model}")
-        
+
         # 根据API提供商设置端点
         if api_provider == "OpenRouter":
             api_endpoint = "https://openrouter.ai/api/v1/chat/completions"
+        elif api_provider == "APICore.ai":
+            api_endpoint = "https://ismaque.org/v1/images/generations"
         else:
             api_endpoint = "https://ai.comfly.chat/v1/chat/completions"
         
@@ -999,6 +1290,13 @@ class TutuGeminiAPI:
             print(f"[Tutu DEBUG] Using provided OpenRouter API key: {openrouter_api_key[:10]}...")
             self.openrouter_api_key = openrouter_api_key
             config['openrouter_api_key'] = openrouter_api_key
+            config_changed = True
+
+        # 处理 APICore.ai API key
+        if apicore_api_key.strip():
+            print(f"[Tutu DEBUG] Using provided APICore.ai API key: {apicore_api_key[:10]}...")
+            self.apicore_api_key = apicore_api_key
+            config['apicore_api_key'] = apicore_api_key
             config_changed = True
             
         # 保存配置
@@ -1112,35 +1410,73 @@ CRITICAL: You MUST return actual {num_images} images, not text descriptions. Eac
                 
                 content.append({"type": "text", "text": enhanced_prompt})
 
-            messages = [{
-                "role": "user",
-                "content": content
-            }]
+            # APICore.ai 使用不同的请求格式
+            if api_provider == "APICore.ai":
+                # APICore.ai 使用专门的图像生成API格式
+                final_prompt = enhanced_prompt if not has_images else f"{prompt}"
 
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "top_p": top_p,
-                "max_tokens": 8192,
-                "stream": True  # Required for gemini-2.5-flash-image-preview
-            }
+                # 如果有输入图像，APICore.ai可能需要特殊处理
+                if has_images:
+                    # 对于APICore.ai，将图像信息作为文本描述添加到prompt中
+                    image_descriptions = []
+                    image_inputs = [
+                        ("input_image_1", input_image_1, "参考图片1"),
+                        ("input_image_2", input_image_2, "参考图片2"),
+                        ("input_image_3", input_image_3, "参考图片3"),
+                        ("input_image_4", input_image_4, "参考图片4"),
+                        ("input_image_5", input_image_5, "参考图片5")
+                    ]
+
+                    for image_var, image_tensor, image_label in image_inputs:
+                        if image_tensor is not None:
+                            image_descriptions.append(f"基于{image_label}的内容")
+
+                    if image_descriptions:
+                        final_prompt = f"{prompt} (参考图像: {', '.join(image_descriptions)})"
+
+                payload = {
+                    "prompt": final_prompt,
+                    "model": clean_model_name(model),  # 移除[APICore]标签
+                    "size": "1x1",  # APICore.ai 的固定格式
+                    "n": num_images
+                }
+                # APICore.ai 不使用流式响应
+                use_streaming = False
+            else:
+                # 其他提供商使用标准ChatCompletion格式
+                messages = [{
+                    "role": "user",
+                    "content": content
+                }]
+
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "max_tokens": 8192,
+                    "n": num_images,
+                    "stream": True  # Required for gemini-2.5-flash-image-preview
+                }
+                use_streaming = True
 
             # 添加调试日志
             print(f"\n[Tutu DEBUG] API Request Details:")
             print(f"[Tutu DEBUG] API Provider: {api_provider}")
             print(f"[Tutu DEBUG] Model: {model}")
             print(f"[Tutu DEBUG] Has images: {has_images}")
-            print(f"[Tutu DEBUG] Messages count: {len(messages)}")
+            if api_provider != "APICore.ai":
+                print(f"[Tutu DEBUG] Messages count: {len(messages)}")
             print(f"[Tutu DEBUG] Content type: {type(content)}")
             print(f"[Tutu DEBUG] Content length: {len(str(content))}")
-            
+
             # 记录payload大小（但不打印图片数据）
             payload_copy = payload.copy()
-            payload_copy['messages'] = [{
-                'role': msg['role'],
-                'content': self._sanitize_content_for_debug(msg['content'])
-            } for msg in payload['messages']]
+            if api_provider != "APICore.ai" and 'messages' in payload:
+                payload_copy['messages'] = [{
+                    'role': msg['role'],
+                    'content': self._sanitize_content_for_debug(msg['content'])
+                } for msg in payload['messages']]
             
             print(f"[Tutu DEBUG] Payload structure: {json.dumps(payload_copy, indent=2, ensure_ascii=False)}")
             
@@ -1151,22 +1487,40 @@ CRITICAL: You MUST return actual {num_images} images, not text descriptions. Eac
             if not current_api_key or len(current_api_key) < 10:
                 print(f"[Tutu DEBUG] WARNING: API Key seems invalid: '{current_api_key[:10] if current_api_key else 'None'}...")
 
+                # 提供详细的API密钥配置指导
+                key_error_msg = self._get_api_key_error_message(api_provider, current_api_key)
+                if not current_api_key:
+                    # 如果完全没有API密钥，抛出错误
+                    raise Exception(key_error_msg)
+
             pbar = comfy.utils.ProgressBar(100)
             pbar.update_absolute(10)
 
             try:
                 print(f"[Tutu DEBUG] Sending request to: {api_endpoint}")
-                response = requests.post(
-                    api_endpoint,
-                    headers=headers,
-                    json=payload,
-                    timeout=self.timeout,
-                    stream=True  # Enable streaming for SSE
-                )
-                
+
+                if api_provider == "APICore.ai":
+                    # APICore.ai 使用标准JSON响应，不是流式
+                    response = requests.post(
+                        api_endpoint,
+                        headers=headers,
+                        json=payload,
+                        timeout=self.timeout
+                        # 不设置stream=True
+                    )
+                else:
+                    # 其他提供商使用流式响应
+                    response = requests.post(
+                        api_endpoint,
+                        headers=headers,
+                        json=payload,
+                        timeout=self.timeout,
+                        stream=True  # Enable streaming for SSE
+                    )
+
                 print(f"[Tutu DEBUG] Response status: {response.status_code}")
                 print(f"[Tutu DEBUG] Response headers: {dict(response.headers)}")
-                
+
                 # 如果状态码不是200，尝试读取错误响应
                 if response.status_code != 200:
                     try:
@@ -1174,13 +1528,19 @@ CRITICAL: You MUST return actual {num_images} images, not text descriptions. Eac
                         print(f"[Tutu DEBUG] Error response body: {error_text}")
                     except:
                         print(f"[Tutu DEBUG] Could not read error response body")
-                
+
                 response.raise_for_status()
-                
-                # Process Server-Sent Events (SSE) stream with API-specific handling
-                response_text = self.process_sse_stream(response, api_provider)
-                print(f"[Tutu DEBUG] SSE流处理完成，获得响应文本长度: {len(response_text)}")
-                
+
+                # 处理响应 - 根据API提供商选择不同的处理方式
+                if api_provider == "APICore.ai":
+                    # APICore.ai 返回标准JSON响应
+                    response_text = self.process_apicore_response(response)
+                else:
+                    # 其他提供商处理SSE流
+                    response_text = self.process_sse_stream(response, api_provider)
+
+                print(f"[Tutu DEBUG] 响应处理完成，获得响应文本长度: {len(response_text)}")
+
             except requests.exceptions.Timeout:
                 print(f"[Tutu DEBUG] Request timeout after {self.timeout} seconds")
                 raise TimeoutError(f"API request timed out after {self.timeout} seconds")
