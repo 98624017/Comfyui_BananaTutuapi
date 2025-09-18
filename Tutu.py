@@ -1,7 +1,5 @@
 import os
 import io
-import math
-import random
 import torch
 import requests
 import time
@@ -11,10 +9,151 @@ from io import BytesIO
 import json
 import comfy.utils
 import re
-import aiohttp
-import asyncio
 import base64
 import uuid
+
+# ===== 增强配置管理系统 =====
+class ConfigurationError(Exception):
+    """配置相关的异常"""
+    pass
+
+# ===== 统一错误处理系统 =====
+import logging
+import traceback
+import textwrap
+from PIL import ImageDraw, ImageFont
+
+# 配置日志记录
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s'
+)
+logger = logging.getLogger('TutuAPI')
+
+class TutuAPIError(Exception):
+    """Tutu API 基础异常类"""
+    def __init__(self, message, error_code=None, provider=None):
+        self.message = message
+        self.error_code = error_code
+        self.provider = provider
+        super().__init__(self.message)
+
+class APIConnectionError(TutuAPIError):
+    """API 连接错误"""
+    pass
+
+class APIResponseError(TutuAPIError):
+    """API 响应错误"""
+    pass
+
+class ImageGenerationError(TutuAPIError):
+    """图像生成相关错误"""
+    pass
+
+def create_error_image_with_text(error_message):
+    """创建包含错误信息的图像"""
+    # 创建错误提示图像
+    img = Image.new('RGB', (512, 512), color='#ffebee')
+    draw = ImageDraw.Draw(img)
+
+    try:
+        # 尝试使用系统字体
+        font = ImageFont.truetype("arial.ttf", 20)
+    except:
+        font = ImageFont.load_default()
+
+    # 包装文本
+    wrapped_text = textwrap.fill(error_message, width=40)
+    draw.text((10, 200), wrapped_text, fill='#d32f2f', font=font)
+
+    return img
+
+def get_user_friendly_message(provider, error_type):
+    """根据提供商和错误类型返回友好消息"""
+    messages = {
+        ("APICore.ai", "connection_error"): "APICore.ai 服务暂时不可用，请检查网络或稍后重试",
+        ("APICore.ai", "auth_error"): "APICore.ai API 密钥无效，请检查配置",
+        ("OpenRouter", "quota_exceeded"): "OpenRouter 配额已用完，请检查账户余额",
+        ("ai.comfly.chat", "model_unavailable"): "选择的模型暂时不可用，请尝试其他模型"
+    }
+
+    return messages.get((provider, error_type), f"{provider} 服务出现问题，请稍后重试")
+
+def create_error_output(message, error_type):
+    """创建错误输出，返回默认图像和错误信息"""
+    # 创建错误提示图像
+    error_image = create_error_image_with_text(message)
+    error_tensor = pil2tensor(error_image)
+
+    return (error_tensor, message, error_type)
+
+def handle_api_error(error, provider, context=""):
+    """统一处理 API 错误"""
+
+    # 记录详细错误信息供调试
+    debug_info = {
+        "provider": provider,
+        "context": context,
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "traceback": traceback.format_exc()
+    }
+
+    logger.error(f"[Tutu Error] {debug_info}")
+    print(f"[Tutu Debug] {debug_info}")
+
+    # 根据错误类型提供用户友好的消息
+    if isinstance(error, requests.exceptions.ConnectionError):
+        user_message = f"无法连接到 {provider} 服务器，请检查网络连接"
+        return create_error_output(user_message, "connection_error")
+
+    elif isinstance(error, requests.exceptions.Timeout):
+        user_message = f"{provider} 服务响应超时，请稍后重试"
+        return create_error_output(user_message, "timeout_error")
+
+    elif isinstance(error, json.JSONDecodeError):
+        user_message = f"{provider} 返回了无效的响应格式"
+        return create_error_output(user_message, "response_format_error")
+
+    else:
+        user_message = f"{provider} 服务出现错误: {str(error)}"
+        return create_error_output(user_message, "general_error")
+
+def validate_image_response(images, expected_count, provider):
+    """验证返回的图像数量和质量"""
+    if not images:
+        raise ImageGenerationError(
+            f"{provider} 未返回任何图像",
+            provider=provider
+        )
+
+    if len(images) != expected_count:
+        logger.warning(f"[Tutu Warning] {provider} 返回了 {len(images)} 张图像，期望 {expected_count} 张")
+
+    # 验证图像有效性
+    valid_images = []
+    for i, image in enumerate(images):
+        if image and hasattr(image, 'size'):
+            valid_images.append(image)
+        else:
+            logger.warning(f"[Tutu Warning] 第 {i+1} 张图像无效，已跳过")
+
+    if not valid_images:
+        raise ImageGenerationError(
+            f"{provider} 返回的图像都无效",
+            provider=provider
+        )
+
+    return valid_images
+
+def log_api_call(provider, model, num_images, success=True):
+    """记录 API 调用统计"""
+    if success:
+        logger.info(f"成功调用 {provider} - {model} - 生成 {num_images} 张图像")
+    else:
+        logger.warning(f"调用 {provider} - {model} 失败")
+
+# ===== 统一错误处理系统结束 =====
 import folder_paths
 import mimetypes
 import cv2
@@ -24,19 +163,225 @@ from comfy.utils import common_upscale
 from comfy.comfy_types import IO
 
 
+def create_default_config():
+    """创建默认配置文件"""
+    return {
+        "comfly_api_key": "your_comfly_api_key_here",
+        "openrouter_api_key": "your_openrouter_api_key_here",
+        "apicore_api_key": "your_apicore_api_key_here",
+        "config_version": "2.0",
+        "default_provider": "ai.comfly.chat"
+    }
+
+def migrate_config_v2(config):
+    """迁移配置到版本2.0"""
+    print("[Tutu] 正在迁移配置到版本2.0...")
+
+    # 确保必需字段存在
+    if "config_version" not in config:
+        config["config_version"] = "2.0"
+
+    if "default_provider" not in config:
+        config["default_provider"] = "ai.comfly.chat"
+
+    # 向后兼容：将旧的api_key字段迁移到comfly_api_key
+    if "api_key" in config and "comfly_api_key" not in config:
+        config["comfly_api_key"] = config["api_key"]
+        print("[Tutu] 已将api_key迁移到comfly_api_key")
+
+    # 确保所有API密钥字段存在
+    if "comfly_api_key" not in config:
+        config["comfly_api_key"] = "your_comfly_api_key_here"
+    if "openrouter_api_key" not in config:
+        config["openrouter_api_key"] = "your_openrouter_api_key_here"
+    if "apicore_api_key" not in config:
+        config["apicore_api_key"] = "your_apicore_api_key_here"
+
+    print("[Tutu] 配置迁移完成")
+    return config
+
+def validate_api_key(provider, api_key):
+    """验证API密钥格式和可用性"""
+    if not api_key or api_key.endswith("_here"):
+        return False, f"{provider} API密钥未配置"
+
+    # 基础格式验证
+    format_checks = {
+        "APICore.ai": lambda k: k.startswith("sk-") and len(k) > 20,
+        "OpenRouter": lambda k: k.startswith("sk-") and len(k) > 20,
+        "ai.comfly.chat": lambda k: len(k) > 10
+    }
+
+    if provider in format_checks:
+        if not format_checks[provider](api_key):
+            return False, f"{provider} API密钥格式无效"
+
+    return True, "密钥格式有效"
+
+def secure_log_config(config):
+    """安全地记录配置信息，隐藏敏感数据"""
+    safe_config = {}
+    for key, value in config.items():
+        if 'key' in key.lower() and isinstance(value, str):
+            # 只显示前4个和后4个字符
+            if len(value) > 8:
+                safe_config[key] = f"{value[:4]}...{value[-4:]}"
+            else:
+                safe_config[key] = "***"
+        else:
+            safe_config[key] = value
+    return safe_config
+
 def get_config():
+    """加载和验证API配置"""
+    global _config_cache, _config_cache_time
+
+    # 检查缓存是否有效
+    current_time = time.time()
+    if _config_cache and (current_time - _config_cache_time) < _config_cache_duration:
+        return _config_cache
+
+    config_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Tutuapi.json')
+
     try:
-        config_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Tutuapi.json')
-        with open(config_path, 'r') as f:  
+        with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
+
+        # 配置版本迁移
+        current_version = config.get('config_version', '1.0')
+        if current_version < '2.0':
+            config = migrate_config_v2(config)
+            # 保存迁移后的配置
+            save_config(config)
+
+        # 更新缓存
+        _config_cache = config
+        _config_cache_time = current_time
+
+        # 安全日志输出
+        safe_config = secure_log_config(config)
+        print(f"[Tutu] 配置加载成功: {safe_config}")
+
         return config
-    except:
-        return {}
+
+    except FileNotFoundError:
+        print("[Tutu] 配置文件不存在，创建默认配置")
+        default_config = create_default_config()
+        save_config(default_config)
+
+        # 更新缓存
+        _config_cache = default_config
+        _config_cache_time = current_time
+
+        return default_config
+    except json.JSONDecodeError as e:
+        print(f"[Tutu] 配置文件JSON格式错误: {e}")
+        default_config = create_default_config()
+
+        # 更新缓存
+        _config_cache = default_config
+        _config_cache_time = current_time
+
+        return default_config
+    except Exception as e:
+        print(f"[Tutu] 配置加载错误: {e}")
+        default_config = create_default_config()
+
+        # 更新缓存
+        _config_cache = default_config
+        _config_cache_time = current_time
+
+        return default_config
 
 def save_config(config):
+    """保存配置文件"""
+    global _config_cache, _config_cache_time
+
     config_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Tutuapi.json')
-    with open(config_path, 'w') as f:
-        json.dump(config, f, indent=4)
+    try:
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+
+        # 清除缓存，确保下次读取时重新加载
+        _config_cache = None
+        _config_cache_time = 0
+
+        # 安全日志输出
+        safe_config = secure_log_config(config)
+        print(f"[Tutu] 配置保存成功: {safe_config}")
+    except Exception as e:
+        print(f"[Tutu] 配置保存失败: {e}")
+
+def clear_config_cache():
+    """清除配置缓存"""
+    global _config_cache, _config_cache_time
+    _config_cache = None
+    _config_cache_time = 0
+
+def get_api_key_for_provider(provider):
+    """获取指定提供商的API密钥，带完整错误处理"""
+    config = get_config()
+    key_mapping = {
+        "ai.comfly.chat": "comfly_api_key",
+        "OpenRouter": "openrouter_api_key",
+        "APICore.ai": "apicore_api_key"
+    }
+
+    key_name = key_mapping.get(provider)
+    if not key_name:
+        raise ConfigurationError(f"不支持的API提供商: {provider}")
+
+    api_key = config.get(key_name, "")
+    is_valid, message = validate_api_key(provider, api_key)
+
+    if not is_valid:
+        raise ConfigurationError(f"配置错误: {message}")
+
+    return api_key
+
+def get_config_help_message(provider):
+    """为不同提供商提供配置帮助信息"""
+    help_messages = {
+        "APICore.ai": """
+APICore.ai 配置说明:
+1. 访问 APICore.ai 官网获取 API 密钥
+2. 在 Tutuapi.json 中设置 'apicore_api_key' 字段
+3. 密钥格式应为 'sk-' 开头的字符串
+""",
+        "OpenRouter": """
+OpenRouter 配置说明:
+1. 访问 https://openrouter.ai/ 获取 API 密钥
+2. 在 Tutuapi.json 中设置 'openrouter_api_key' 字段
+3. 密钥格式应为 'sk-' 开头的字符串
+""",
+        "ai.comfly.chat": """
+ai.comfly.chat 配置说明:
+1. 访问 https://ai.comfly.chat/ 获取 API 密钥
+2. 在 Tutuapi.json 中设置 'comfly_api_key' 字段
+3. 支持向后兼容的 'api_key' 字段
+"""
+    }
+    return help_messages.get(provider, "请检查API密钥配置")
+# ===== 增强配置管理系统结束 =====
+
+# 配置缓存优化
+_config_cache = None
+_config_cache_time = 0
+_config_cache_duration = 30  # 缓存30秒
+
+# 图片输入映射常量
+IMAGE_INPUT_MAPPING = [
+    ("input_image_1", "图片1"),
+    ("input_image_2", "图片2"),
+    ("input_image_3", "图片3"),
+    ("input_image_4", "图片4"),
+    ("input_image_5", "图片5")
+]
+
+def get_image_inputs_list(input_image_1, input_image_2, input_image_3, input_image_4, input_image_5):
+    """根据图片输入生成带标签的图片列表"""
+    images = [input_image_1, input_image_2, input_image_3, input_image_4, input_image_5]
+    return [(var_name, images[i], label) for i, (var_name, label) in enumerate(IMAGE_INPUT_MAPPING)]
 
 def clean_model_name(model_with_tag):
     """清理模型名称，移除提供商标签"""
@@ -267,24 +612,6 @@ class TutuGeminiAPI:
         
         return result
     
-    def _sanitize_content_for_debug(self, content):
-        """为调试输出清理内容（移除敏感数据）"""
-        if isinstance(content, str):
-            # 如果内容包含base64图片，截断显示
-            if 'data:image/' in content:
-                parts = content.split('data:image/')
-                if len(parts) > 1:
-                    # 只显示第一部分文本 + base64开头
-                    base64_start = parts[1][:50] + "..." if len(parts[1]) > 50 else parts[1]
-                    return parts[0] + f"data:image/{base64_start}"
-            return content[:200] + "..." if len(content) > 200 else content
-        elif isinstance(content, list):
-            return [self._sanitize_content_for_debug(item) for item in content]
-        elif isinstance(content, dict):
-            return {k: self._sanitize_content_for_debug(v) for k, v in content.items()}
-        else:
-            return content
-
     def get_current_api_key(self, api_provider):
         """根据API提供商获取对应的API key"""
         if api_provider == "OpenRouter":
@@ -1084,6 +1411,186 @@ class TutuGeminiAPI:
         width, height = map(int, resolution_str.split('x'))
         return (width, height)
 
+    def _log_process_start(self, prompt, api_provider, model, input_image_1, input_image_2, input_image_3, input_image_4, input_image_5):
+        """记录处理开始时的调试信息"""
+        print(f"\n[Tutu DEBUG] ========== Starting Gemini API Process ==========")
+        print(f"[Tutu DEBUG] Parameters:")
+        print(f"[Tutu DEBUG] - API Provider: {api_provider}")
+        print(f"[Tutu DEBUG] - Model: {model}")
+        print(f"[Tutu DEBUG] - Prompt length: {len(prompt) if prompt else 0}")
+        print(f"[Tutu DEBUG] - Has input_image_1: {input_image_1 is not None}")
+        print(f"[Tutu DEBUG] - Has input_image_2: {input_image_2 is not None}")
+        print(f"[Tutu DEBUG] - Has input_image_3: {input_image_3 is not None}")
+        print(f"[Tutu DEBUG] - Has input_image_4: {input_image_4 is not None}")
+        print(f"[Tutu DEBUG] - Has input_image_5: {input_image_5 is not None}")
+
+        # Display model selection guide
+        print(f"\n[Tutu INFO] 💡 Model Selection Guide:")
+        print(f"[Tutu INFO] • For ai.comfly.chat: Select [Comfly] tagged models")
+        print(f"[Tutu INFO] • For OpenRouter: Select [OpenRouter] tagged models")
+        print(f"[Tutu INFO] • For APICore.ai: Select [APICore] tagged models")
+        print(f"[Tutu INFO] • Current combination: {api_provider} + {model}")
+
+    def _get_api_endpoint(self, api_provider):
+        """根据API提供商获取端点URL"""
+        if api_provider == "OpenRouter":
+            return "https://openrouter.ai/api/v1/chat/completions"
+        elif api_provider == "APICore.ai":
+            return "https://ismaque.org/v1/images/generations"
+        else:
+            return "https://ai.comfly.chat/v1/chat/completions"
+
+    def _handle_apicore_images(self, prompt, has_images, input_image_1, input_image_2, input_image_3, input_image_4, input_image_5):
+        """处理APICore.ai的图片上传逻辑"""
+        if not has_images:
+            return prompt
+
+        # 上传所有输入图像并获得URL
+        image_urls = []
+        image_inputs = get_image_inputs_list(input_image_1, input_image_2, input_image_3, input_image_4, input_image_5)
+
+        for image_var, image_tensor, image_label in image_inputs:
+            if image_tensor is not None:
+                try:
+                    # 转换tensor为PIL图像
+                    pil_image = tensor2pil(image_tensor)
+                    # 上传图像获得URL
+                    image_url = self.upload_image(pil_image)
+                    if image_url:
+                        image_urls.append(image_url)
+                        print(f"[Tutu] {image_label}上传成功: {image_url}")
+                    else:
+                        print(f"[Tutu Warning] {image_label}上传失败")
+                except Exception as e:
+                    print(f"[Tutu Error] {image_label}处理失败: {str(e)}")
+
+        if image_urls:
+            # 构建多图片参考格式: "URL1 URL2 用户描述"
+            final_prompt = f"{' '.join(image_urls)} {prompt}"
+            print(f"[Tutu] APICore.ai多图片参考: {len(image_urls)}张图片 + 用户描述")
+            return final_prompt
+        else:
+            print("[Tutu Warning] 所有图片上传失败，使用纯文本模式")
+            return prompt
+
+    def _build_request_content(self, prompt, api_provider, num_images, input_image_1, input_image_2, input_image_3, input_image_4, input_image_5):
+        """构建请求内容"""
+        has_images = any([input_image_1 is not None, input_image_2 is not None, input_image_3 is not None,
+                         input_image_4 is not None, input_image_5 is not None])
+
+        # 使用标准OpenAI格式（数组）- 适用于所有API提供商
+        content = []
+
+        if has_images:
+            # 对于图片编辑任务，先添加图片，再添加指令文本
+            image_inputs = get_image_inputs_list(input_image_1, input_image_2, input_image_3, input_image_4, input_image_5)
+
+            for image_var, image_tensor, image_label in image_inputs:
+                if image_tensor is not None:
+                    pil_image = tensor2pil(image_tensor)[0]
+                    print(f"[Tutu DEBUG] 处理 {image_var} (标识为 {image_label})...")
+
+                    # 统一使用base64格式，保持原始质量
+                    print(f"[Tutu DEBUG] {image_var} 使用base64格式...")
+                    image_base64 = self.image_to_base64(pil_image)
+                    image_url = f"data:image/png;base64,{image_base64}"
+                    print(f"[Tutu DEBUG] {image_var} base64大小: {len(image_base64)} 字符")
+
+                    # 先添加图片标识文本
+                    content.append({
+                        "type": "text",
+                        "text": f"[这是{image_label}]"
+                    })
+
+                    # 再添加图片
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": image_url}
+                    })
+
+            # 添加文本指令
+            if api_provider == "ai.comfly.chat":
+                # 为ai.comfly.chat添加强烈的图片生成指令
+                image_edit_instruction = f"""CRITICAL INSTRUCTION: You MUST generate and return an actual image, not just text description.
+
+Task: {prompt}
+
+Image References:
+- When I mention "图片1", I mean the first image provided above
+- When I mention "图片2", I mean the second image provided above
+- When I mention "图片3", I mean the third image provided above
+- And so on...
+
+REQUIREMENTS:
+1. GENERATE a new image based on my request
+2. DO NOT just describe what the image should look like
+3. RETURN the actual image file/data
+4. The output MUST be a visual image, not text
+
+Execute the image editing task now and return the generated image."""
+                content.append({"type": "text", "text": image_edit_instruction})
+            else:
+                enhanced_prompt = f"""IMPORTANT: Generate an actual image, not just a description.
+
+Task: {prompt}
+
+Image references: 图片1, 图片2, 图片3, etc. refer to the images provided above in order.
+
+MUST return a generated image, not text description."""
+                content.append({"type": "text", "text": enhanced_prompt})
+
+            # 计算图片数量（每张图片对应两个元素：标签+图片）
+            image_count = sum(1 for _, img, _ in image_inputs if img is not None)
+            print(f"[Tutu DEBUG] content数组长度: {len(content)} (图片: {image_count}, 图片标签: {image_count}, 文本指令: 1)")
+        else:
+            # 生成图片任务（无输入图片）
+            if num_images == 1:
+                enhanced_prompt = f"""GENERATE AN IMAGE: Create a high-quality, detailed image.
+
+Description: {prompt}
+
+CRITICAL: You MUST return an actual image, not just text description. Use your image generation capabilities to create the visual content."""
+            else:
+                enhanced_prompt = f"""GENERATE {num_images} DIFFERENT IMAGES: Create {num_images} unique, high-quality images with VARIED content, each with distinct visual elements.
+
+Description: {prompt}
+
+CRITICAL: You MUST return actual {num_images} images, not text descriptions. Each image must be visually different."""
+
+            content.append({"type": "text", "text": enhanced_prompt})
+
+        return content, has_images
+
+    def _update_api_keys(self, comfly_api_key, openrouter_api_key, apicore_api_key):
+        """更新API密钥配置"""
+        config_changed = False
+        config = get_config()
+
+        # 处理 comfly API key
+        if comfly_api_key.strip():
+            print(f"[Tutu DEBUG] Using provided comfly API key: {comfly_api_key[:10]}...")
+            self.comfly_api_key = comfly_api_key
+            config['comfly_api_key'] = comfly_api_key
+            config_changed = True
+
+        # 处理 OpenRouter API key
+        if openrouter_api_key.strip():
+            print(f"[Tutu DEBUG] Using provided OpenRouter API key: {openrouter_api_key[:10]}...")
+            self.openrouter_api_key = openrouter_api_key
+            config['openrouter_api_key'] = openrouter_api_key
+            config_changed = True
+
+        # 处理 APICore.ai API key
+        if apicore_api_key.strip():
+            print(f"[Tutu DEBUG] Using provided APICore.ai API key: {apicore_api_key[:10]}...")
+            self.apicore_api_key = apicore_api_key
+            config['apicore_api_key'] = apicore_api_key
+            config_changed = True
+
+        # 保存配置
+        if config_changed:
+            save_config(config)
+
     def _sanitize_content_for_debug(self, content):
         """Sanitize content for debug logging"""
         if isinstance(content, str):
@@ -1232,32 +1739,11 @@ class TutuGeminiAPI:
                 input_image_1=None, input_image_2=None, input_image_3=None, input_image_4=None, input_image_5=None,
                 comfly_api_key="", openrouter_api_key="", apicore_api_key=""):
 
-        print(f"\n[Tutu DEBUG] ========== Starting Gemini API Process ==========")
-        print(f"[Tutu DEBUG] Parameters:")
-        print(f"[Tutu DEBUG] - API Provider: {api_provider}")
-        print(f"[Tutu DEBUG] - Model: {model}")
-        print(f"[Tutu DEBUG] - Prompt length: {len(prompt) if prompt else 0}")
-        print(f"[Tutu DEBUG] - Has input_image_1: {input_image_1 is not None}")
-        print(f"[Tutu DEBUG] - Has input_image_2: {input_image_2 is not None}")
-        print(f"[Tutu DEBUG] - Has input_image_3: {input_image_3 is not None}")
-        print(f"[Tutu DEBUG] - Has input_image_4: {input_image_4 is not None}")
-        print(f"[Tutu DEBUG] - Has input_image_5: {input_image_5 is not None}")
-        
-        # Display model selection guide
-        print(f"\n[Tutu INFO] 💡 Model Selection Guide:")
-        print(f"[Tutu INFO] • For ai.comfly.chat: Select [Comfly] tagged models")
-        print(f"[Tutu INFO] • For OpenRouter: Select [OpenRouter] tagged models")
-        print(f"[Tutu INFO] • For APICore.ai: Select [APICore] tagged models")
-        print(f"[Tutu INFO] • Current combination: {api_provider} + {model}")
+        # 记录处理开始信息
+        self._log_process_start(prompt, api_provider, model, input_image_1, input_image_2, input_image_3, input_image_4, input_image_5)
 
         # 根据API提供商设置端点
-        if api_provider == "OpenRouter":
-            api_endpoint = "https://openrouter.ai/api/v1/chat/completions"
-        elif api_provider == "APICore.ai":
-            api_endpoint = "https://ismaque.org/v1/images/generations"
-        else:
-            api_endpoint = "https://ai.comfly.chat/v1/chat/completions"
-        
+        api_endpoint = self._get_api_endpoint(api_provider)
         print(f"[Tutu DEBUG] API Endpoint: {api_endpoint}")
 
         # 处理模型选择并验证
@@ -1267,41 +1753,12 @@ class TutuGeminiAPI:
             error_msg = f"❌ 模型选择错误！\n\n当前选择: '{model}'\nAPI提供商: '{api_provider}'\n\n💡 建议选择:\n{suggestions}\n\n请重新选择正确的模型。"
             print(f"[Tutu ERROR] {error_msg}")
             return self.handle_error(input_image_1, input_image_2, input_image_3, input_image_4, input_image_5, error_msg)
-        
+
         model = actual_model
         print(f"[Tutu DEBUG] Using actual model: {model}")
 
-        # Save original prompt for processing
-        original_prompt = prompt
-        
         # 处理API Key更新和保存
-        config_changed = False
-        config = get_config()
-        
-        # 处理 comfly API key
-        if comfly_api_key.strip():
-            print(f"[Tutu DEBUG] Using provided comfly API key: {comfly_api_key[:10]}...")
-            self.comfly_api_key = comfly_api_key
-            config['comfly_api_key'] = comfly_api_key
-            config_changed = True
-            
-        # 处理 OpenRouter API key
-        if openrouter_api_key.strip():
-            print(f"[Tutu DEBUG] Using provided OpenRouter API key: {openrouter_api_key[:10]}...")
-            self.openrouter_api_key = openrouter_api_key
-            config['openrouter_api_key'] = openrouter_api_key
-            config_changed = True
-
-        # 处理 APICore.ai API key
-        if apicore_api_key.strip():
-            print(f"[Tutu DEBUG] Using provided APICore.ai API key: {apicore_api_key[:10]}...")
-            self.apicore_api_key = apicore_api_key
-            config['apicore_api_key'] = apicore_api_key
-            config_changed = True
-            
-        # 保存配置
-        if config_changed:
-            save_config(config)
+        self._update_api_keys(comfly_api_key, openrouter_api_key, apicore_api_key)
             
         # 显示当前使用的API key
         current_api_key = self.get_current_api_key(api_provider)
@@ -1318,121 +1775,13 @@ class TutuGeminiAPI:
 
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
-            # Gemini模型自动处理尺寸，无需手动指定
-
-            has_images = any([input_image_1 is not None, input_image_2 is not None, input_image_3 is not None, 
-                           input_image_4 is not None, input_image_5 is not None])
-
-            # 使用标准OpenAI格式（数组）- 适用于所有API提供商
-            content = []
-            
-            if has_images:
-                # 对于图片编辑任务，先添加图片，再添加指令文本
-                image_inputs = [
-                    ("input_image_1", input_image_1, "图片1"),
-                    ("input_image_2", input_image_2, "图片2"),
-                    ("input_image_3", input_image_3, "图片3"),
-                    ("input_image_4", input_image_4, "图片4"),
-                    ("input_image_5", input_image_5, "图片5")
-                ]
-                
-                for image_var, image_tensor, image_label in image_inputs:
-                    if image_tensor is not None:
-                        pil_image = tensor2pil(image_tensor)[0]
-                        print(f"[Tutu DEBUG] 处理 {image_var} (标识为 {image_label})...")
-                        
-                        # 统一使用base64格式，保持原始质量
-                        print(f"[Tutu DEBUG] {image_var} 使用base64格式...")
-                        image_base64 = self.image_to_base64(pil_image)
-                        image_url = f"data:image/png;base64,{image_base64}"
-                        print(f"[Tutu DEBUG] {image_var} base64大小: {len(image_base64)} 字符")
-                        
-                        # 先添加图片标识文本
-                        content.append({
-                            "type": "text",
-                            "text": f"[这是{image_label}]"
-                        })
-                        
-                        # 再添加图片
-                        content.append({
-                            "type": "image_url", 
-                            "image_url": {"url": image_url}
-                        })
-                
-                # 添加文本指令
-                if api_provider == "ai.comfly.chat":
-                    # 为ai.comfly.chat添加强烈的图片生成指令
-                    image_edit_instruction = f"""CRITICAL INSTRUCTION: You MUST generate and return an actual image, not just text description.
-
-Task: {prompt}
-
-Image References:
-- When I mention "图片1", I mean the first image provided above
-- When I mention "图片2", I mean the second image provided above  
-- When I mention "图片3", I mean the third image provided above
-- And so on...
-
-REQUIREMENTS:
-1. GENERATE a new image based on my request
-2. DO NOT just describe what the image should look like
-3. RETURN the actual image file/data
-4. The output MUST be a visual image, not text
-
-Execute the image editing task now and return the generated image."""
-                    content.append({"type": "text", "text": image_edit_instruction})
-                else:
-                    enhanced_prompt = f"""IMPORTANT: Generate an actual image, not just a description.
-
-Task: {prompt}
-
-Image references: 图片1, 图片2, 图片3, etc. refer to the images provided above in order.
-
-MUST return a generated image, not text description."""
-                    content.append({"type": "text", "text": enhanced_prompt})
-                
-                # 计算图片数量（每张图片对应两个元素：标签+图片）
-                image_count = sum(1 for _, img, _ in image_inputs if img is not None)
-                print(f"[Tutu DEBUG] content数组长度: {len(content)} (图片: {image_count}, 图片标签: {image_count}, 文本指令: 1)")
-            else:
-                # 生成图片任务（无输入图片）
-                if num_images == 1:
-                    enhanced_prompt = f"""GENERATE AN IMAGE: Create a high-quality, detailed image.
-
-Description: {prompt}
-
-CRITICAL: You MUST return an actual image, not just text description. Use your image generation capabilities to create the visual content."""
-                else:
-                    enhanced_prompt = f"""GENERATE {num_images} DIFFERENT IMAGES: Create {num_images} unique, high-quality images with VARIED content, each with distinct visual elements.
-
-Description: {prompt}
-
-CRITICAL: You MUST return actual {num_images} images, not text descriptions. Each image must be visually different."""
-                
-                content.append({"type": "text", "text": enhanced_prompt})
+            # 构建请求内容
+            content, has_images = self._build_request_content(prompt, api_provider, num_images, input_image_1, input_image_2, input_image_3, input_image_4, input_image_5)
 
             # APICore.ai 使用不同的请求格式
             if api_provider == "APICore.ai":
-                # APICore.ai 使用专门的图像生成API格式
-                final_prompt = enhanced_prompt if not has_images else f"{prompt}"
-
-                # 如果有输入图像，APICore.ai可能需要特殊处理
-                if has_images:
-                    # 对于APICore.ai，将图像信息作为文本描述添加到prompt中
-                    image_descriptions = []
-                    image_inputs = [
-                        ("input_image_1", input_image_1, "参考图片1"),
-                        ("input_image_2", input_image_2, "参考图片2"),
-                        ("input_image_3", input_image_3, "参考图片3"),
-                        ("input_image_4", input_image_4, "参考图片4"),
-                        ("input_image_5", input_image_5, "参考图片5")
-                    ]
-
-                    for image_var, image_tensor, image_label in image_inputs:
-                        if image_tensor is not None:
-                            image_descriptions.append(f"基于{image_label}的内容")
-
-                    if image_descriptions:
-                        final_prompt = f"{prompt} (参考图像: {', '.join(image_descriptions)})"
+                # 处理图片上传并构建最终提示词
+                final_prompt = self._handle_apicore_images(prompt, has_images, input_image_1, input_image_2, input_image_3, input_image_4, input_image_5)
 
                 payload = {
                     "prompt": final_prompt,
